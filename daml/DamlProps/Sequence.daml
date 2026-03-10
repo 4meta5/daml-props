@@ -1,0 +1,74 @@
+-- | Sequence runner: generates and executes random action sequences.
+-- Users define action types and execution functions; this module provides
+-- the scaffolding for generation, execution, and invariant checking.
+module DamlProps.Sequence where
+
+import DamlProps.Gen
+
+
+-- | A generic step in a test sequence.
+-- Users wrap their domain-specific choices in this type.
+data Step a = Step with
+  label : Text      -- ^ Human-readable description
+  payload : a       -- ^ The domain-specific action data
+    deriving (Show, Eq)
+
+-- | Information about a sequence failure.
+data FailureInfo s a = FailureInfo with
+  stepIndex : Int            -- ^ Index in sequence where failure occurred
+  step : Step a              -- ^ The step that caused/preceded the failure
+  state : s                  -- ^ State at point of failure
+  invariantError : Text      -- ^ Which invariant was violated
+    deriving (Show, Eq)
+
+-- | Generate a sequence of steps.
+genSequence : Int -> Gen a -> Gen [Step a]
+genSequence maxLen genPayload =
+  let genStep = genBind genPayload $ \payload ->
+        genPure (Step "step" payload)
+  in genList 1 maxLen genStep
+
+-- | Execute a sequence of steps, checking invariants after each.
+-- Returns either the first failure or the final state.
+runSequence :
+  (s -> a -> Either Text s) ->    -- ^ Step executor (pure)
+  (s -> Either Text ()) ->        -- ^ Invariant checker
+  s ->                             -- ^ Initial state
+  [Step a] ->                     -- ^ Steps to execute
+  Either (FailureInfo s a) s
+runSequence executor checkInvs initialState steps =
+  runSequenceGo executor checkInvs 0 initialState steps
+
+-- | Top-level recursive helper for runSequence.
+runSequenceGo :
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  Int -> s -> [Step a] ->
+  Either (FailureInfo s a) s
+runSequenceGo _ _ _ state [] = Right state
+runSequenceGo executor checkInvs idx state (step :: rest) =
+  case executor state step.payload of
+    Left err ->
+      Left (FailureInfo idx step state ("Step failed: " <> err))
+    Right newState ->
+      case checkInvs newState of
+        Left err ->
+          Left (FailureInfo idx step newState err)
+        Right () ->
+          runSequenceGo executor checkInvs (idx + 1) newState rest
+
+-- | Check if a sequence fails (for use by the shrinker).
+sequenceFails :
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  [Step a] ->
+  Bool
+sequenceFails executor checkInvs state steps =
+  case runSequence executor checkInvs state steps of
+    Left _ -> True
+    Right _ -> False
+
+-- | Get the payloads from a list of steps.
+stepPayloads : [Step a] -> [a]
+stepPayloads = map (\s -> s.payload)

@@ -1,0 +1,40 @@
+-- | PRNG wrapper around DA.Random.Minstd.
+-- Provides seed splitting and range-bounded generation.
+module DamlProps.Seed where
+
+import DA.Random (Minstd, minstd_init, minstd_rand)
+
+data Seed = Seed with
+  prng : Minstd
+
+mkSeed : Int -> Seed
+mkSeed n = Seed (minstd_init n)
+
+-- | Generate next random Int in [0, bound).
+-- minstd_rand returns (Minstd, Int) with Int in [0, bound).
+nextInt : Seed -> (Int, Seed)
+nextInt (Seed g) =
+  let (g', n) = minstd_rand 2147483647 g
+  in (n, Seed g')
+
+nextInRange : Int -> Int -> Seed -> (Int, Seed)
+nextInRange lo hi seed =
+  let range = hi - lo + 1
+      (g', n) = minstd_rand range seed.prng
+  in (lo + n, Seed g')
+
+split : Seed -> (Seed, Seed)
+split seed =
+  let (n1, seed') = nextInt seed
+      (n2, _) = nextInt seed'
+  in (mkSeed (abs n1 + 1), mkSeed (abs n2 + 1))
+
+nextDecimal : Seed -> (Decimal, Seed)
+nextDecimal seed =
+  let (n, seed') = nextInRange 0 1_000_000_000 seed
+  in (intToDecimal n / 1_000_000_000.0, seed')
+
+nextDecimalInRange : Decimal -> Decimal -> Seed -> (Decimal, Seed)
+nextDecimalInRange lo hi seed =
+  let (frac, seed') = nextDecimal seed
+  in (lo + frac * (hi - lo), seed')

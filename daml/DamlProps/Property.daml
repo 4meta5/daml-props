@@ -1,0 +1,96 @@
+-- | Property definition and forAll combinator.
+-- Users define properties as functions from generated values to Script assertions.
+module DamlProps.Property where
+
+import DamlProps.Gen
+import DamlProps.Seed
+
+-- | Configuration for property-based tests.
+data PropConfig = PropConfig with
+  numTests : Int         -- ^ Number of random seeds to try
+  maxShrinks : Int       -- ^ Maximum shrink iterations
+  startSeed : Int        -- ^ Starting seed value
+    deriving (Show, Eq)
+
+-- | Default configuration: 100 tests, 100 shrink rounds, seed starts at 1.
+defaultConfig : PropConfig
+defaultConfig = PropConfig with
+  numTests = 100
+  maxShrinks = 100
+  startSeed = 1
+
+-- | Result of a property check.
+data PropResult
+  = PropSuccess with testsRun : Int
+  | PropFailure with
+      testsRun : Int
+      failSeed : Int
+      failureMsg : Text
+    deriving (Show, Eq)
+
+-- | A property is a generator paired with a predicate.
+data Property a = Property with
+  gen : Gen a
+  check : a -> Bool
+  label : Text
+
+-- | Create a property: for all generated values, the predicate holds.
+mkProperty : Text -> Gen a -> (a -> Bool) -> Property a
+mkProperty label gen check = Property gen check label
+
+-- | Run a pure property (no Script effects) with default config.
+forAll : Text -> Gen a -> (a -> Bool) -> PropResult
+forAll label gen check = forAllWith defaultConfig label gen check
+
+-- | Run a pure property with custom config.
+forAllWith : PropConfig -> Text -> Gen a -> (a -> Bool) -> PropResult
+forAllWith config label gen check =
+  forAllGo config label gen check config.startSeed 0
+
+-- | Top-level recursive helper for forAllWith.
+forAllGo : PropConfig -> Text -> Gen a -> (a -> Bool) -> Int -> Int -> PropResult
+forAllGo config label gen check seedVal testsRun
+  | testsRun >= config.numTests = PropSuccess testsRun
+  | otherwise =
+    let seed = mkSeed seedVal
+        (value, _) = gen.run seed
+    in if check value
+       then forAllGo config label gen check (seedVal + 1) (testsRun + 1)
+       else PropFailure with
+              testsRun
+              failSeed = seedVal
+              failureMsg = label <> " failed on seed " <> show seedVal
+
+-- | Assert a pure property passes. Calls error on failure.
+assertProperty : Text -> Gen a -> (a -> Bool) -> ()
+assertProperty label gen check =
+  case forAll label gen check of
+    PropSuccess _ -> ()
+    PropFailure _ _ msg -> error msg
+
+-- | Assert a property with show for better error messages.
+assertPropertyShow : (a -> Text) -> Text -> Gen a -> (a -> Bool) -> ()
+assertPropertyShow showA label gen check =
+  assertPropertyShowGo showA label gen check defaultConfig defaultConfig.startSeed 0
+
+-- | Top-level recursive helper for assertPropertyShow.
+assertPropertyShowGo : (a -> Text) -> Text -> Gen a -> (a -> Bool) -> PropConfig -> Int -> Int -> ()
+assertPropertyShowGo showA label gen check config seedVal testsRun
+  | testsRun >= config.numTests = ()
+  | otherwise =
+    let seed = mkSeed seedVal
+        (value, _) = gen.run seed
+    in if check value
+       then assertPropertyShowGo showA label gen check config (seedVal + 1) (testsRun + 1)
+       else error (label <> " failed on seed " <> show seedVal
+                  <> "\nCounterexample: " <> showA value)
+
+-- | Check if a PropResult is a success.
+isSuccess : PropResult -> Bool
+isSuccess (PropSuccess _) = True
+isSuccess _ = False
+
+-- | Check if a PropResult is a failure.
+isFailure : PropResult -> Bool
+isFailure (PropFailure _ _ _) = True
+isFailure _ = False

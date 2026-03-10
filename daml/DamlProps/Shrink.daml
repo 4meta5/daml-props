@@ -1,0 +1,105 @@
+-- | Delta-debugging shrinker.
+-- Reduces a failing action sequence to the minimal subsequence that still fails.
+module DamlProps.Shrink where
+
+import DamlProps.Sequence (Step, sequenceFails)
+
+-- | Shrink configuration.
+data ShrinkConfig = ShrinkConfig with
+  maxRounds : Int    -- ^ Maximum total shrink iterations
+    deriving (Show, Eq)
+
+-- | Default shrink config: 100 rounds max.
+defaultShrinkConfig : ShrinkConfig
+defaultShrinkConfig = ShrinkConfig 100
+
+-- | Shrink a failing sequence to the minimal failing subsequence.
+-- Uses two phases: binary removal then single-step removal.
+shrinkSequence :
+  ShrinkConfig ->
+  (s -> a -> Either Text s) ->    -- ^ Action executor
+  (s -> Either Text ()) ->        -- ^ Invariant checker
+  s ->                             -- ^ Initial state
+  [Step a] ->                   -- ^ Failing sequence
+  [Step a]                      -- ^ Minimal failing sequence
+shrinkSequence config executor checkInvs state actions =
+  let reduced = binaryRemove config.maxRounds executor checkInvs state actions
+      roundsUsed = length actions - length reduced
+      roundsLeft = config.maxRounds - (if roundsUsed > 0 then roundsUsed else 0)
+      minimal = singleRemoveGo executor checkInvs state 0 roundsLeft reduced
+  in minimal
+
+-- | Phase 1: Binary removal.
+-- Try removing each half; if either half still fails, recurse on that half.
+binaryRemove :
+  Int ->
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  [Step a] ->
+  [Step a]
+binaryRemove maxRounds executor checkInvs state actions
+  | maxRounds <= 0 = actions
+  | length actions <= 1 = actions
+  | otherwise =
+    let mid = length actions / 2
+        left = take mid actions
+        right = drop mid actions
+    in if sequenceFails executor checkInvs state left
+       then binaryRemove (maxRounds - 1) executor checkInvs state left
+       else if sequenceFails executor checkInvs state right
+            then binaryRemove (maxRounds - 1) executor checkInvs state right
+            else actions
+
+-- | Phase 2: Single-step removal (top-level recursive).
+singleRemoveGo :
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  Int -> Int -> [Step a] ->
+  [Step a]
+singleRemoveGo _ _ _ _ rounds acts | rounds <= 0 = acts
+singleRemoveGo _ _ _ idx _ acts | idx >= length acts = acts
+singleRemoveGo executor checkInvs state idx rounds acts =
+  let without = take idx acts <> drop (idx + 1) acts
+  in if sequenceFails executor checkInvs state without
+     then singleRemoveGo executor checkInvs state idx (rounds - 1) without
+     else singleRemoveGo executor checkInvs state (idx + 1) (rounds - 1) acts
+
+-- | Shrink a single value toward a target using a list of candidates.
+-- Returns the smallest candidate that still triggers the predicate.
+shrinkValue : (a -> Bool) -> [a] -> Optional a
+shrinkValue _ [] = None
+shrinkValue predicate (candidate :: rest) =
+  if predicate candidate
+  then case shrinkValue predicate rest of
+    Some smaller -> Some smaller
+    None -> Some candidate
+  else shrinkValue predicate rest
+
+-- | Generate shrink candidates for an Int toward 0.
+shrinkInt : Int -> [Int]
+shrinkInt 0 = []
+shrinkInt n =
+  let absN = abs n
+      halves = shrinkIntGo absN []
+  in if n < 0 then map negate halves <> halves
+     else halves
+
+-- | Top-level recursive helper for shrinkInt.
+shrinkIntGo : Int -> [Int] -> [Int]
+shrinkIntGo 0 acc = reverse acc
+shrinkIntGo x acc = shrinkIntGo (x / 2) (x / 2 :: acc)
+
+-- | Generate shrink candidates for a Decimal toward 0.0.
+shrinkDecimal : Decimal -> [Decimal]
+shrinkDecimal d
+  | d == 0.0 = []
+  | d < 0.0 = map negate (shrinkDecimal (negate d))
+  | otherwise = [0.0, d / 2.0, d * 3.0 / 4.0]
+
+-- | Generate shrink candidates for a list (remove elements).
+shrinkList : [a] -> [[a]]
+shrinkList [] = []
+shrinkList xs =
+  map (\i -> take i xs <> drop (i + 1) xs) [0..(length xs - 1)]

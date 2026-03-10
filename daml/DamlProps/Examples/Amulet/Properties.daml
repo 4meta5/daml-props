@@ -1,0 +1,81 @@
+-- | Property-based tests for the amulet model.
+-- Demonstrates AUDIT3 H2 bug detection: zero-input featured-app transfers
+-- mint reward coupons without burning any amulet.
+module DamlProps.Examples.Amulet.Properties where
+
+import Daml.Script
+import DamlProps.Gen
+import DamlProps.Runner
+import DamlProps.Examples.Amulet.Model
+
+-- | Initial state: parties 1-3 each hold 500.0 amulet.
+testInitialState : AmuletState
+testInitialState = mkInitialAmuletState defaultAmuletConfig
+  [(1, 500.0), (2, 500.0), (3, 500.0)]
+
+-- | Runner config for amulet properties.
+amConfig : Text -> RunnerConfig
+amConfig name = (defaultRunnerConfig name) with
+  numTests = 100
+  maxSequenceLength = 10
+
+-- | Property A: AUDIT3 H2 detection on BUGGY model.
+-- The buggy executor mirrors splice's checkTransferConstraints which only checks
+-- max input count, NOT min input count. A zero-input featured-app transfer mints
+-- reward coupons without burning any amulet.
+--
+-- This test EXPECTS FoundFailure — it is a negative test demonstrating bug detection.
+test_amuletH2Buggy : Script ()
+test_amuletH2Buggy = script do
+  let result = runProp (amConfig "amulet-H2-buggy") genAmuletAction
+                executeAmuletBuggy noRewardsWithoutBurn testInitialState
+  case result of
+    FoundFailure d -> do
+      -- daml-props found the H2 bug
+      debug ("H2 DETECTED by daml-props:")
+      debug ("  Seed: " <> show d.fdSeed)
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: H2 bug should have been detected on buggy model"
+
+-- | Property B: Fixed model passes conservation.
+-- The fixed executor adds `null inputs => Left "empty inputs"`, preventing H2.
+test_amuletH2Fixed : Script ()
+test_amuletH2Fixed = script do
+  let result = runProp (amConfig "amulet-H2-fixed") genAmuletAction
+                executeAmuletFixed checkAmuletInvariantsFixed testInitialState
+  case result of
+    AllPassed _ n -> debug ("amulet-H2-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
+
+-- | Property C: Fee non-negativity.
+-- senderChange >= 0 is enforced by the executor (returns Left on negative).
+-- This verifies the executor never produces a state with anomalous fees.
+test_amuletFeeNonNegativity : Script ()
+test_amuletFeeNonNegativity = script do
+  let checkFees st =
+        if st.totalBurned < 0.0
+        then Left ("Negative total burned: " <> show st.totalBurned)
+        else Right ()
+  let result = runProp (amConfig "fee-non-negativity") genAmuletAction
+                executeAmuletFixed checkFees testInitialState
+  case result of
+    AllPassed _ n -> debug ("fee-non-negativity: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
+
+-- | Property D: Max constraints respected.
+-- No accepted transfer has more inputs/outputs than config allows.
+test_amuletMaxConstraints : Script ()
+test_amuletMaxConstraints = script do
+  -- Use large transfer generator to stress limits.
+  let genLarge = genFrequency
+        [ (1, genNormalTransfer)
+        , (1, genLargeTransfer)
+        , (1, genFeaturedTransfer)
+        ]
+  let result = runProp (amConfig "max-constraints") genLarge
+                executeAmuletFixed amuletPositiveAmounts testInitialState
+  case result of
+    AllPassed _ n -> debug ("max-constraints: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)

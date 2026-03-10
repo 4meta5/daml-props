@@ -1,0 +1,137 @@
+-- | Top-level test runner.
+-- Runs N seeds, reports failures, integrates with dpm test via DAML Script.
+module DamlProps.Runner where
+
+import DamlProps.Gen
+import DamlProps.Seed
+import DamlProps.Sequence
+import DamlProps.Shrink
+
+-- | Full runner configuration.
+data RunnerConfig = RunnerConfig with
+  name : Text                -- ^ Property name
+  numTests : Int             -- ^ Number of seeds to try
+  maxSequenceLength : Int    -- ^ Maximum actions per sequence
+  shrinkConfig : ShrinkConfig -- ^ Shrinking configuration
+  startSeed : Int            -- ^ Starting seed value
+    deriving (Show, Eq)
+
+-- | Default runner configuration.
+defaultRunnerConfig : Text -> RunnerConfig
+defaultRunnerConfig name = RunnerConfig with
+  name
+  numTests = 100
+  maxSequenceLength = 10
+  shrinkConfig = defaultShrinkConfig
+  startSeed = 1
+
+-- | Details of a found failure.
+data FailureDetail s a = FailureDetail with
+  fdName : Text
+  fdTestsRun : Int
+  fdSeed : Int
+  fdOriginalLength : Int
+  fdMinimalSequence : [Step a]
+  fdFailure : FailureInfo s a
+    deriving (Show, Eq)
+
+-- | Result of a property test run.
+data RunResult s a
+  = AllPassed with rpName : Text; rpTestsRun : Int
+  | FoundFailure with detail : FailureDetail s a
+    deriving (Show, Eq)
+
+-- | Run a property-based test (pure, no Script).
+runProp :
+  RunnerConfig ->
+  Gen a ->
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  RunResult s a
+runProp config genPayload executor checkInvs initialState =
+  runPropGo config genPayload executor checkInvs initialState config.startSeed 0
+
+-- | Top-level recursive helper for runProp.
+runPropGo :
+  RunnerConfig ->
+  Gen a ->
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  Int -> Int ->
+  RunResult s a
+runPropGo config genPayload executor checkInvs initialState seedVal testsRun
+  | testsRun >= config.numTests =
+    AllPassed config.name config.numTests
+  | otherwise =
+    let seed = mkSeed seedVal
+        stepGen = genSequence config.maxSequenceLength genPayload
+        (steps, _) = stepGen.run seed
+    in case runSequence executor checkInvs initialState steps of
+      Right _ ->
+        runPropGo config genPayload executor checkInvs initialState (seedVal + 1) (testsRun + 1)
+      Left failure ->
+        let minimal = shrinkSequence
+              config.shrinkConfig executor checkInvs initialState steps
+        in FoundFailure (FailureDetail
+            config.name testsRun seedVal (length steps) minimal failure)
+
+-- | Convenience: run a property and assert it passes (calls error on failure).
+assertProp :
+  (Show a, Show s) =>
+  RunnerConfig ->
+  Gen a ->
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  ()
+assertProp config genPayload executor checkInvs initialState =
+  case runProp config genPayload executor checkInvs initialState of
+    AllPassed _ _ -> ()
+    FoundFailure d -> error (formatDetail d)
+
+-- | Convenience: quick property check with defaults.
+quickCheck :
+  (Show a, Show s) =>
+  Text ->
+  Gen a ->
+  (s -> a -> Either Text s) ->
+  (s -> Either Text ()) ->
+  s ->
+  ()
+quickCheck name = assertProp (defaultRunnerConfig name)
+
+-- | Format failure detail for display.
+formatDetail : (Show a, Show s) => FailureDetail s a -> Text
+formatDetail d =
+  d.fdName <> " FAILED"
+  <> "\n  Seed: " <> show d.fdSeed
+  <> "\n  Tests run before failure: " <> show d.fdTestsRun
+  <> "\n  Original sequence length: " <> show d.fdOriginalLength
+  <> "\n  Minimal sequence length: " <> show (length d.fdMinimalSequence)
+  <> "\n  Minimal sequence: " <> show (map (\s -> s.label) d.fdMinimalSequence)
+  <> "\n  Invariant violated: " <> d.fdFailure.invariantError
+  <> "\n  Failed at step: " <> show d.fdFailure.stepIndex
+
+-- | Format a result for display.
+formatResult : (Show a, Show s) => RunResult s a -> Text
+formatResult (AllPassed n count) = n <> ": PASSED (" <> show count <> " tests)"
+formatResult (FoundFailure d) = formatDetail d
+
+-- | Format a result summary (single line).
+formatSummary : RunResult s a -> Text
+formatSummary (AllPassed n count) = n <> ": OK (" <> show count <> " tests)"
+formatSummary (FoundFailure d) =
+  d.fdName <> ": FAILED (seed=" <> show d.fdSeed
+  <> ", " <> show (length d.fdMinimalSequence) <> " steps minimal)"
+
+-- | Check if a run result is a pass.
+isPassed : RunResult s a -> Bool
+isPassed (AllPassed _ _) = True
+isPassed _ = False
+
+-- | Check if a run result is a failure.
+isFailed : RunResult s a -> Bool
+isFailed (FoundFailure _) = True
+isFailed _ = False

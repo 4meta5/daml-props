@@ -1,0 +1,127 @@
+-- | Generator combinators for property-based testing.
+-- Hedgehog-inspired but without typeclasses.
+module DamlProps.Gen where
+
+import DamlProps.Seed
+import DA.List ((!!))
+
+-- | A generator produces a value of type @a@ from a seed.
+data Gen a = Gen with
+  run : Seed -> (a, Seed)
+
+-- | Map a function over a generator.
+genMap : (a -> b) -> Gen a -> Gen b
+genMap f (Gen g) = Gen $ \seed ->
+  let (a, seed') = g seed
+  in (f a, seed')
+
+-- | Bind: sequence generators.
+genBind : Gen a -> (a -> Gen b) -> Gen b
+genBind (Gen ga) f = Gen $ \seed ->
+  let (a, seed') = ga seed
+      Gen gb = f a
+  in gb seed'
+
+-- | Lift a pure value into a generator.
+genPure : a -> Gen a
+genPure a = Gen $ \seed -> (a, seed)
+
+-- | Generate an Int in range [lo, hi].
+genInt : Int -> Int -> Gen Int
+genInt lo hi = Gen $ \seed -> nextInRange lo hi seed
+
+-- | Generate a Bool.
+genBool : Gen Bool
+genBool = Gen $ \seed ->
+  let (n, seed') = nextInRange 0 1 seed
+  in (n == 1, seed')
+
+-- | Generate a Decimal in range [lo, hi].
+genDecimal : Decimal -> Decimal -> Gen Decimal
+genDecimal lo hi = Gen $ \seed ->
+  let (n, seed') = nextInRange 0 1_000_000_000 seed
+      range = hi - lo
+      value = lo + range * intToDecimal n / 1_000_000_000.0
+  in (value, seed')
+
+-- | Generate a positive amount suitable for token operations.
+genAmount : Gen Decimal
+genAmount = genDecimal 0.0000000001 10_000_000.0
+
+-- | Generate a small positive amount (for edge-case testing).
+genSmallAmount : Gen Decimal
+genSmallAmount = genDecimal 0.0000000001 1.0
+
+-- | Pick a random element from a non-empty list.
+genElement : [a] -> Gen a
+genElement xs = Gen $ \seed ->
+  let (idx, seed') = nextInRange 0 (length xs - 1) seed
+  in (xs !! idx, seed')
+
+-- | Generate a list of length in [lo, hi].
+genList : Int -> Int -> Gen a -> Gen [a]
+genList lo hi gen = Gen $ \seed ->
+  let (n, seed') = nextInRange lo hi seed
+  in genListGo gen n seed' []
+
+-- | Top-level recursive helper for genList.
+genListGo : Gen a -> Int -> Seed -> [a] -> ([a], Seed)
+genListGo _ 0 s acc = (reverse acc, s)
+genListGo gen remaining s acc =
+  let (a, s') = gen.run s
+  in genListGo gen (remaining - 1) s' (a :: acc)
+
+-- | Generate an Optional with configurable None probability (0-100).
+genMaybe : Int -> Gen a -> Gen (Optional a)
+genMaybe nonePct gen = Gen $ \seed ->
+  let (n, seed') = nextInRange 1 100 seed
+  in if n <= nonePct
+     then (None, seed')
+     else let (a, seed'') = gen.run seed'
+          in (Some a, seed'')
+
+-- | Generate one of the given generators, chosen uniformly.
+genOneOf : [Gen a] -> Gen a
+genOneOf gens = Gen $ \seed ->
+  let (idx, seed') = nextInRange 0 (length gens - 1) seed
+      Gen chosen = gens !! idx
+  in chosen seed'
+
+-- | Generate with frequency weighting. Each pair is (weight, generator).
+genFrequency : [(Int, Gen a)] -> Gen a
+genFrequency weighted = Gen $ \seed ->
+  let total = foldl (\acc (w, _) -> acc + w) 0 weighted
+      (n, seed') = nextInRange 1 total seed
+  in pickWeighted n weighted seed'
+
+-- | Top-level recursive helper for genFrequency.
+pickWeighted : Int -> [(Int, Gen a)] -> Seed -> (a, Seed)
+pickWeighted _ [] _ = error "genFrequency: empty list"
+pickWeighted n ((w, Gen g) :: rest) seed
+  | n <= w = g seed
+  | otherwise = pickWeighted (n - w) rest seed
+
+-- | Generate a pair.
+genPair : Gen a -> Gen b -> Gen (a, b)
+genPair ga gb = Gen $ \seed ->
+  let (a, seed') = ga.run seed
+      (b, seed'') = gb.run seed'
+  in ((a, b), seed'')
+
+-- | Generate a non-empty list of length in [1, hi].
+genNonEmpty : Int -> Gen a -> Gen [a]
+genNonEmpty hi gen = genList 1 hi gen
+
+-- | Filter a generator (retry up to maxAttempts times).
+genFilter : Int -> (a -> Bool) -> Gen a -> Gen a
+genFilter maxAttempts predicate gen = Gen $ \seed ->
+  tryGenFilter gen predicate maxAttempts seed
+
+-- | Top-level recursive helper for genFilter.
+tryGenFilter : Gen a -> (a -> Bool) -> Int -> Seed -> (a, Seed)
+tryGenFilter _ _ 0 _ = error "genFilter: exhausted attempts"
+tryGenFilter gen predicate remaining seed =
+  let (a, seed') = gen.run seed
+  in if predicate a
+     then (a, seed')
+     else tryGenFilter gen predicate (remaining - 1) seed'

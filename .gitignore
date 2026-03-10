@@ -1,0 +1,19 @@
+# DAML build artifacts
+.daml/
+
+# Internal documentation
+PLAN.md
+DOGFOOD.md
+CLAUDE.md
+
+# Claude Code local config
+.claude/
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml

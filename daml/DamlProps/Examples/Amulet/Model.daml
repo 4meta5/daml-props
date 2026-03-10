@@ -1,0 +1,194 @@
+-- | Pure state-machine model of splice AmuletRules transfer engine.
+-- Models checkTransferConstraints (AmuletRules.daml:783-788) and reward minting.
+-- Two executor variants: buggy (mirrors splice as-is) and fixed (adds min input check).
+-- The buggy variant reproduces AUDIT3 finding H2: zero-input featured-app transfers
+-- mint reward coupons without burning any amulet.
+--
+-- Design: Invalid preconditions (max limits, insufficient funds) → Right state (no-op).
+-- The buggy model ALLOWS zero-input transfers through (the bug).
+-- The invariant checker then detects rewards minted without burn.
+module DamlProps.Examples.Amulet.Model where
+
+import DamlProps.Gen
+
+-- | Transfer configuration (simplified model of AmuletConfig.TransferConfig).
+data AmuletConfig = AmuletConfig with
+  createFee : Decimal
+  transferFeeRate : Decimal
+  extraAppReward : Decimal
+  maxNumInputs : Int
+  maxNumOutputs : Int
+    deriving (Show, Eq)
+
+-- | Default config matching splice defaults.
+defaultAmuletConfig : AmuletConfig
+defaultAmuletConfig = AmuletConfig with
+  createFee = 0.03
+  transferFeeRate = 0.001
+  extraAppReward = 16.5
+  maxNumInputs = 100
+  maxNumOutputs = 100
+
+-- | Amulet ledger state.
+data AmuletState = AmuletState with
+  amulets : [(Int, Decimal)]
+  rewardCoupons : [Decimal]
+  totalBurned : Decimal
+  totalMinted : Decimal
+  config : AmuletConfig
+    deriving (Show, Eq)
+
+-- | Create initial amulet state.
+mkInitialAmuletState : AmuletConfig -> [(Int, Decimal)] -> AmuletState
+mkInitialAmuletState config holdings = AmuletState
+  holdings [] 0.0 0.0 config
+
+-- | An amulet transfer action.
+data AmuletAction = AmuletAction with
+  atSender : Int
+  atInputAmounts : [Decimal]
+  atOutputs : [(Int, Decimal)]
+  atIsFeaturedApp : Bool
+    deriving (Show, Eq)
+
+-- | BUGGY executor: mirrors splice as-is.
+-- Does NOT reject zero inputs. Allows featured-app reward minting without burn.
+executeAmuletBuggy : AmuletState -> AmuletAction -> Either Text AmuletState
+executeAmuletBuggy state action =
+  -- checkTransferConstraints: only checks MAX, not MIN
+  if length action.atInputAmounts > state.config.maxNumInputs
+    then Right state  -- no-op: too many inputs
+  else if length action.atOutputs > state.config.maxNumOutputs
+    then Right state  -- no-op: too many outputs
+  else
+    -- Zero inputs ALLOWED through — this is the H2 bug
+    executeAmuletCore state action
+
+-- | FIXED executor: adds min input check.
+executeAmuletFixed : AmuletState -> AmuletAction -> Either Text AmuletState
+executeAmuletFixed state action =
+  if null action.atInputAmounts
+    then Right state  -- no-op: reject zero inputs
+  else if length action.atInputAmounts > state.config.maxNumInputs
+    then Right state
+  else if length action.atOutputs > state.config.maxNumOutputs
+    then Right state
+  else
+    executeAmuletCore state action
+
+-- | Core transfer execution (shared).
+executeAmuletCore : AmuletState -> AmuletAction -> Either Text AmuletState
+executeAmuletCore state action =
+  let totalInput = foldl (+) 0.0 action.atInputAmounts
+      totalOutputAmount = foldl (\acc (_, a) -> acc + a) 0.0 action.atOutputs
+      numOutputs = length action.atOutputs
+      outputFees = intToDecimal numOutputs * state.config.createFee
+                 + totalOutputAmount * state.config.transferFeeRate
+      senderChange = totalInput - totalOutputAmount - outputFees
+  in
+  -- Insufficient funds → no-op
+  if senderChange < 0.0 then Right state
+  else
+    -- Try to remove consumed inputs from sender
+    case removeInputs action.atSender action.atInputAmounts state.amulets of
+      None -> Right state  -- no-op: sender doesn't have the inputs
+      Some remaining ->
+        let changeHoldings = if senderChange > 0.0
+                             then [(action.atSender, senderChange)]
+                             else []
+            -- Reward minting: featured app gets extraAppReward UNCONDITIONALLY
+            -- H2 bug: rewards minted even with zero inputs burned
+            appReward = if action.atIsFeaturedApp
+                        then state.config.extraAppReward
+                        else 0.0
+            newRewards = if appReward > 0.0 then [appReward] else []
+        in Right state with
+            amulets = remaining <> action.atOutputs <> changeHoldings
+            rewardCoupons = state.rewardCoupons <> newRewards
+            totalBurned = state.totalBurned + outputFees
+            totalMinted = state.totalMinted + appReward
+
+-- | Remove input amounts from sender's holdings. Returns None if can't match.
+removeInputs : Int -> [Decimal] -> [(Int, Decimal)] -> Optional [(Int, Decimal)]
+removeInputs _ [] holdings = Some holdings
+removeInputs sender (amt :: restAmts) holdings =
+  case removeOneHolding sender amt holdings of
+    None -> None
+    Some remaining -> removeInputs sender restAmts remaining
+
+-- | Remove one holding matching (sender, amount).
+removeOneHolding : Int -> Decimal -> [(Int, Decimal)] -> Optional [(Int, Decimal)]
+removeOneHolding _ _ [] = None
+removeOneHolding sender amt ((o, a) :: rest) =
+  if o == sender && a == amt
+  then Some rest
+  else case removeOneHolding sender amt rest of
+    None -> None
+    Some remaining -> Some ((o, a) :: remaining)
+
+-- | INVARIANT: No rewards without burn.
+-- If totalMinted > 0 but totalBurned == 0, rewards were minted for free.
+noRewardsWithoutBurn : AmuletState -> Either Text ()
+noRewardsWithoutBurn state =
+  if state.totalMinted > 0.0 && state.totalBurned == 0.0
+    then Left ("Rewards minted (" <> show state.totalMinted
+              <> ") without any amulet burned (totalBurned=0.0)")
+  else Right ()
+
+-- | INVARIANT: All amulet amounts positive.
+amuletPositiveAmounts : AmuletState -> Either Text ()
+amuletPositiveAmounts state =
+  let negs = filter (\(_, a) -> a <= 0.0) state.amulets
+  in if null negs then Right ()
+     else Left ("Non-positive amulet amounts: " <> show negs)
+
+-- | Combined invariant for the fixed model.
+checkAmuletInvariantsFixed : AmuletState -> Either Text ()
+checkAmuletInvariantsFixed state =
+  case amuletPositiveAmounts state of
+    Left err -> Left err
+    Right () -> noRewardsWithoutBurn state
+
+-- | Generate amulet actions. Biased toward edge cases.
+genAmuletAction : Gen AmuletAction
+genAmuletAction = genFrequency
+  [ (4, genNormalTransfer)
+  , (3, genZeroInputTransfer)
+  , (2, genFeaturedTransfer)
+  , (1, genLargeTransfer)
+  ]
+
+genNormalTransfer : Gen AmuletAction
+genNormalTransfer =
+  genBind (genInt 1 3) $ \sender ->
+  genBind (genList 1 3 (genDecimal 1.0 100.0)) $ \inputs ->
+  genBind (genInt 1 3) $ \receiver ->
+  genBind (genDecimal 0.1 50.0) $ \outAmt ->
+  genPure (AmuletAction sender inputs [(receiver, outAmt)] False)
+
+-- | Zero-input featured transfer: the H2 trigger.
+genZeroInputTransfer : Gen AmuletAction
+genZeroInputTransfer =
+  genBind (genInt 1 3) $ \sender ->
+  genPure (AmuletAction sender [] [] True)
+
+genFeaturedTransfer : Gen AmuletAction
+genFeaturedTransfer =
+  genBind (genInt 1 3) $ \sender ->
+  genBind (genList 1 2 (genDecimal 10.0 200.0)) $ \inputs ->
+  genBind (genInt 1 3) $ \receiver ->
+  genBind (genDecimal 1.0 50.0) $ \outAmt ->
+  genPure (AmuletAction sender inputs [(receiver, outAmt)] True)
+
+genLargeTransfer : Gen AmuletAction
+genLargeTransfer =
+  genBind (genInt 1 3) $ \sender ->
+  genBind (genList 5 20 (genDecimal 1.0 50.0)) $ \inputs ->
+  genBind (genList 1 5 genOutput) $ \outputs ->
+  genPure (AmuletAction sender inputs outputs False)
+
+genOutput : Gen (Int, Decimal)
+genOutput =
+  genBind (genInt 1 3) $ \receiver ->
+  genBind (genDecimal 0.1 20.0) $ \amount ->
+  genPure (receiver, amount)

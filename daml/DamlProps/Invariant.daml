@@ -1,0 +1,108 @@
+-- | Invariant definitions for property-based testing.
+-- Provides built-in invariants and combinators for user-defined ones.
+module DamlProps.Invariant where
+
+-- | Ledger state snapshot: amounts held by each party.
+-- Generic representation that works across token implementations.
+data LedgerState = LedgerState with
+  balances : [(Party, Decimal)]   -- ^ Party -> total holdings
+  holdingCount : Int              -- ^ Total number of holdings on ledger
+  holdingAmounts : [Decimal]      -- ^ Individual holding amounts
+    deriving (Show, Eq)
+
+-- | Result of a transfer operation.
+data TransferResult = TransferResult with
+  inputAmounts : [Decimal]        -- ^ Amounts of consumed inputs
+  outputAmounts : [Decimal]       -- ^ Amounts of created outputs (receiver + change)
+  senderChangeAmount : Decimal    -- ^ Change returned to sender
+  receiverAmount : Decimal        -- ^ Amount received by receiver
+    deriving (Show, Eq)
+
+-- | An invariant is a check that must hold after each action.
+-- Returns Left errorMsg on violation, Right () on success.
+type Invariant = LedgerState -> Either Text ()
+
+-- | An invariant over transfer results.
+type TransferInvariant = TransferResult -> Either Text ()
+
+-- | Amount conservation: sum(inputs) == sum(outputs).
+conservationInvariant : TransferInvariant
+conservationInvariant result =
+  let inputTotal = foldl (+) 0.0 result.inputAmounts
+      outputTotal = foldl (+) 0.0 result.outputAmounts
+  in if inputTotal == outputTotal
+     then Right ()
+     else Left ("Conservation violated: inputs=" <> show inputTotal
+               <> " outputs=" <> show outputTotal)
+
+-- | Positive amounts: every holding has amount > 0.0.
+positiveAmountInvariant : Invariant
+positiveAmountInvariant state =
+  let negatives = filter (<= 0.0) state.holdingAmounts
+  in if null negatives
+     then Right ()
+     else Left ("Non-positive holding amounts found: " <> show negatives)
+
+-- | Non-empty inputs: a successful transfer must consume at least one input.
+nonEmptyInputInvariant : TransferInvariant
+nonEmptyInputInvariant result =
+  if null result.inputAmounts
+  then Left "Transfer succeeded with zero inputs"
+  else Right ()
+
+-- | Balance non-negative: no party has negative total balance.
+nonNegativeBalanceInvariant : Invariant
+nonNegativeBalanceInvariant state =
+  let negParties = filter (\(_, bal) -> bal < 0.0) state.balances
+  in if null negParties
+     then Right ()
+     else Left ("Negative balances found: " <> show negParties)
+
+-- | Total supply conservation: total supply doesn't change across actions.
+supplyConservationInvariant : Decimal -> Invariant
+supplyConservationInvariant expectedTotal state =
+  let actualTotal = foldl (\acc (_, bal) -> acc + bal) 0.0 state.balances
+  in if actualTotal == expectedTotal
+     then Right ()
+     else Left ("Supply changed: expected=" <> show expectedTotal
+               <> " actual=" <> show actualTotal)
+
+-- | Combine multiple invariants. Fails on first violation.
+combineInvariants : [Invariant] -> Invariant
+combineInvariants invs state =
+  foldl (\acc inv -> case acc of
+    Left err -> Left err
+    Right () -> inv state
+  ) (Right ()) invs
+
+-- | Combine multiple transfer invariants.
+combineTransferInvariants : [TransferInvariant] -> TransferInvariant
+combineTransferInvariants invs result =
+  foldl (\acc inv -> case acc of
+    Left err -> Left err
+    Right () -> inv result
+  ) (Right ()) invs
+
+-- | Label an invariant for better error messages.
+labelInvariant : Text -> Invariant -> Invariant
+labelInvariant name inv state = case inv state of
+  Left err -> Left ("[" <> name <> "] " <> err)
+  Right () -> Right ()
+
+-- | Label a transfer invariant for better error messages.
+labelTransferInvariant : Text -> TransferInvariant -> TransferInvariant
+labelTransferInvariant name inv result = case inv result of
+  Left err -> Left ("[" <> name <> "] " <> err)
+  Right () -> Right ()
+
+-- | Check an invariant, asserting on failure.
+assertInvariant : Invariant -> LedgerState -> ()
+assertInvariant inv state = case inv state of
+  Left err -> error ("Invariant violation: " <> err)
+  Right () -> ()
+
+-- | Check a transfer invariant, asserting on failure.
+assertTransferInvariant : TransferInvariant -> TransferResult -> ()
+assertTransferInvariant inv result = case inv result of
+  Left err -> error ("Transfer invariant violation: " <> err)
+  Right () -> ()
