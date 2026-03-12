@@ -1,5 +1,10 @@
 # daml-props
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> [!WARNING]
+> This software is experimental and not intended for production use. Use at your own risk.
+
 Property-based testing for DAML. Pure DAML, no external dependencies.
 
 Inspired by [Hedgehog](https://github.com/hedgehogqa/haskell-hedgehog) and [Echidna](https://github.com/crytic/echidna), daml-props generates random inputs, checks that your invariants hold for all of them, and shrinks failing cases to minimal counterexamples.
