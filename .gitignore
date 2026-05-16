@@ -1,5 +1,6 @@
 # DAML build artifacts
 .daml/
+.cache/
 
 # Internal documentation
 PLAN.md
