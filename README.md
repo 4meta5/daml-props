@@ -32,7 +32,7 @@ dependencies:
   - path/to/daml-props/.daml/dist/daml-props-0.1.0.dar
 ```
 
-Requires DAML SDK 3.4.10 (target 2.1). Build with `dpm build`, test with `dpm test`.
+Requires DAML SDK 3.4.11 (target 2.1). Build with `dpm build`, test with `dpm test`.
 
 ## Quick Start
 
@@ -248,7 +248,7 @@ To use daml-props in your own test package:
 
 ## Requirements
 
-- DAML SDK 3.4.10 (target: 2.1)
+- DAML SDK 3.4.11 (target: 2.1)
 - Build tool: [`dpm`](https://github.com/OpenZeppelin/dpm) (not the deprecated `daml` CLI)
 - Dependencies: `daml-prim`, `daml-stdlib`, `daml-script`
 
