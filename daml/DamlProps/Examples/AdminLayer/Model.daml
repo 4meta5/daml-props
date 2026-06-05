@@ -1,0 +1,218 @@
+-- | Pure state-machine model of the OpenZeppelin canton-token-template admin layer.
+-- Models the minting control path of `SimpleToken/Rules.daml` (`Rules_Mint`),
+-- `SimpleToken/Admin/Capability.daml` (`consumeMintAllowance`, `requireRole`)
+-- and the Pausable gate (`assertNotPaused`).
+--
+-- Three admin-layer semantics are modeled as state-machine invariants:
+--   * Pause          — while paused, no mint may increase supply (origination control).
+--   * Authorization  — only a party holding a minter capability can mint.
+--   * Conservation   — cumulative minted by a capped minter never exceeds its
+--                      initial allowance (CIP supply invariant D3).
+--
+-- Following the Amulet example's design, each semantic has a FIXED executor
+-- (mirroring the real contract logic) and a BUGGY executor that drops exactly
+-- one guard. The fixed executor satisfies every invariant for all action
+-- sequences; each buggy executor is caught by the invariant whose guard it
+-- dropped — demonstrating the properties have teeth.
+--
+-- Design: invalid actions (paused, unauthorized, over-allowance, non-positive)
+-- are no-ops (Right state unchanged), exactly as the real choices reject with
+-- `assertMsg`/`ensure` without mutating the ledger.
+module DamlProps.Examples.AdminLayer.Model where
+
+import DamlProps.Gen
+
+-- | A capped minter: party id, the allowance it was issued, and what remains.
+-- Mirrors `RoleCapability` with `role = Minter` and `mintAllowance = Some _`.
+data Minter = Minter with
+  mId : Int
+  initialAllowance : Decimal
+  remaining : Decimal
+    deriving (Show, Eq)
+
+-- | Admin-layer ledger state.
+data AdminState = AdminState with
+  paused : Bool
+  minters : [Minter]
+  totalMinted : Decimal
+  -- ^ Cumulative amount minted across all minters.
+  mintedWhilePaused : Decimal
+  -- ^ Amount minted while paused. The real layer blocks this entirely, so a
+  -- correct model keeps it at 0.0; the pause invariant asserts exactly that.
+  unauthorizedMinted : Decimal
+  -- ^ Amount minted by parties holding no minter capability. A correct model
+  -- keeps it at 0.0; the authorization invariant asserts exactly that.
+    deriving (Show, Eq)
+
+-- | Build the initial state from a set of capped minters (unpaused, nothing minted).
+mkInitialAdminState : [Minter] -> AdminState
+mkInitialAdminState ms = AdminState with
+  paused = False
+  minters = ms
+  totalMinted = 0.0
+  mintedWhilePaused = 0.0
+  unauthorizedMinted = 0.0
+
+-- | The admin-layer actions a caller may attempt.
+data AdminAction
+  = Mint with maId : Int; maAmount : Decimal
+  | Pause
+  | Unpause
+    deriving (Show, Eq)
+
+-- | Sum of every minter's initial allowance — the global conservation bound.
+initialAllowanceSum : AdminState -> Decimal
+initialAllowanceSum state =
+  foldl (\acc m -> acc + m.initialAllowance) 0.0 state.minters
+
+-- | Total allowance consumed so far (initial minus remaining, summed).
+consumedAllowance : AdminState -> Decimal
+consumedAllowance state =
+  foldl (\acc m -> acc + (m.initialAllowance - m.remaining)) 0.0 state.minters
+
+-- | Look up a minter by party id.
+findMinter : Int -> [Minter] -> Optional Minter
+findMinter _ [] = None
+findMinter mid (m :: rest) = if m.mId == mid then Some m else findMinter mid rest
+
+-- | Decrement a minter's remaining allowance by `amt`.
+decrementMinter : Int -> Decimal -> [Minter] -> [Minter]
+decrementMinter mid amt = map adjust
+  where adjust m = if m.mId == mid then m with remaining = m.remaining - amt else m
+
+-- | FIXED executor: mirrors `Rules_Mint` + `consumeMintAllowance` + `assertNotPaused`.
+-- Enforces all three guards: pause, authorization, and the allowance cap.
+executeAdminFixed : AdminState -> AdminAction -> Either Text AdminState
+executeAdminFixed state Pause = Right state with paused = True
+executeAdminFixed state Unpause = Right state with paused = False
+executeAdminFixed state (Mint mid amt)
+  | state.paused = Right state                       -- assertNotPaused: blocked
+  | amt <= 0.0 = Right state                          -- eMintAmountNotPositive
+  | otherwise = case findMinter mid state.minters of
+      None -> Right state                             -- not a minter: requireRole fails
+      Some m ->
+        if amt > m.remaining
+          then Right state                            -- eMintAllowanceExceeded
+          else Right state with
+            minters = decrementMinter mid amt state.minters
+            totalMinted = state.totalMinted + amt
+
+-- | BUGGY executor — drops the pause guard. Mints succeed while paused and the
+-- minted amount is recorded in `mintedWhilePaused`. Caught by `invNoMintWhilePaused`.
+executeAdminNoPause : AdminState -> AdminAction -> Either Text AdminState
+executeAdminNoPause state Pause = Right state with paused = True
+executeAdminNoPause state Unpause = Right state with paused = False
+executeAdminNoPause state (Mint mid amt)
+  | amt <= 0.0 = Right state
+  | otherwise = case findMinter mid state.minters of
+      None -> Right state
+      Some m ->
+        if amt > m.remaining
+          then Right state
+          else Right state with
+            minters = decrementMinter mid amt state.minters
+            totalMinted = state.totalMinted + amt
+            mintedWhilePaused =
+              state.mintedWhilePaused + (if state.paused then amt else 0.0)
+
+-- | BUGGY executor — drops the allowance cap. A capped minter can mint beyond
+-- its allowance, driving `remaining` negative and `totalMinted` past the bound.
+-- Caught by `invConservation` / `invNonNegativeAllowance`.
+executeAdminNoAllowance : AdminState -> AdminAction -> Either Text AdminState
+executeAdminNoAllowance state Pause = Right state with paused = True
+executeAdminNoAllowance state Unpause = Right state with paused = False
+executeAdminNoAllowance state (Mint mid amt)
+  | state.paused = Right state
+  | amt <= 0.0 = Right state
+  | otherwise = case findMinter mid state.minters of
+      None -> Right state
+      Some _ -> Right state with                      -- no cap check
+        minters = decrementMinter mid amt state.minters
+        totalMinted = state.totalMinted + amt
+
+-- | BUGGY executor — drops the authorization guard. A party with no minter
+-- capability can mint, recorded in `unauthorizedMinted`. Caught by `invAuthorized`.
+executeAdminNoAuth : AdminState -> AdminAction -> Either Text AdminState
+executeAdminNoAuth state Pause = Right state with paused = True
+executeAdminNoAuth state Unpause = Right state with paused = False
+executeAdminNoAuth state (Mint mid amt)
+  | state.paused = Right state
+  | amt <= 0.0 = Right state
+  | otherwise = case findMinter mid state.minters of
+      Some m ->
+        if amt > m.remaining
+          then Right state
+          else Right state with
+            minters = decrementMinter mid amt state.minters
+            totalMinted = state.totalMinted + amt
+      None -> Right state with                        -- unauthorized mint admitted
+        totalMinted = state.totalMinted + amt
+        unauthorizedMinted = state.unauthorizedMinted + amt
+
+-- | INVARIANT (conservation, D3): cumulative minted never exceeds the sum of
+-- initial allowances.
+invConservation : AdminState -> Either Text ()
+invConservation state =
+  if state.totalMinted > initialAllowanceSum state
+    then Left ("totalMinted (" <> show state.totalMinted
+              <> ") exceeds initial allowance sum (" <> show (initialAllowanceSum state) <> ")")
+    else Right ()
+
+-- | INVARIANT: no minter's remaining allowance is ever negative.
+invNonNegativeAllowance : AdminState -> Either Text ()
+invNonNegativeAllowance state =
+  let negs = filter (\m -> m.remaining < 0.0) state.minters
+  in if null negs then Right ()
+     else Left ("Negative remaining allowance: " <> show negs)
+
+-- | INVARIANT: minted supply is exactly the allowance consumed from minters
+-- (no supply appears from outside the capped minter set).
+invConsistency : AdminState -> Either Text ()
+invConsistency state =
+  if state.totalMinted == consumedAllowance state
+    then Right ()
+    else Left ("totalMinted (" <> show state.totalMinted
+              <> ") /= consumed allowance (" <> show (consumedAllowance state) <> ")")
+
+-- | INVARIANT (pause): nothing was ever minted while paused.
+invNoMintWhilePaused : AdminState -> Either Text ()
+invNoMintWhilePaused state =
+  if state.mintedWhilePaused > 0.0
+    then Left ("Minted " <> show state.mintedWhilePaused <> " while paused")
+    else Right ()
+
+-- | INVARIANT (authorization): nothing was ever minted by a non-minter party.
+invAuthorized : AdminState -> Either Text ()
+invAuthorized state =
+  if state.unauthorizedMinted > 0.0
+    then Left ("Unauthorized parties minted " <> show state.unauthorizedMinted)
+    else Right ()
+
+-- | Combined invariant for the fixed model: all five hold simultaneously.
+checkAdminInvariants : AdminState -> Either Text ()
+checkAdminInvariants state =
+  case invConservation state of
+    Left e -> Left e
+    Right () -> case invNonNegativeAllowance state of
+      Left e -> Left e
+      Right () -> case invConsistency state of
+        Left e -> Left e
+        Right () -> case invNoMintWhilePaused state of
+          Left e -> Left e
+          Right () -> invAuthorized state
+
+-- | Generate admin-layer actions. Party ids 1-4: some are minters, some are
+-- not (stressing authorization); amounts span 0 and values above per-minter
+-- allowance (stressing the cap); pause/unpause interleave (stressing the gate).
+genAdminAction : Gen AdminAction
+genAdminAction = genFrequency
+  [ (5, genMintAction)
+  , (2, genPure Pause)
+  , (2, genPure Unpause)
+  ]
+
+genMintAction : Gen AdminAction
+genMintAction =
+  genBind (genInt 1 4) $ \mid ->
+  genBind (genDecimal 0.0 60.0) $ \amt ->
+  genPure (Mint mid amt)

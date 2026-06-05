@@ -1,0 +1,90 @@
+-- | Property-based tests for the admin-layer model.
+-- Demonstrates that the OpenZeppelin canton-token-template admin layer's three
+-- minting-control semantics — pause, authorization, and allowance conservation —
+-- hold for all action sequences, and that dropping any one guard is detected.
+module DamlProps.Examples.AdminLayer.Properties where
+
+import Daml.Script
+import DamlProps.Runner
+import DamlProps.Examples.AdminLayer.Model
+
+-- | Initial state: two capped minters (parties 1 and 2) with allowances 100 and
+-- 50. Parties 3 and 4 hold no capability — the action generator emits mints from
+-- all four, so authorization and the allowance cap are both exercised.
+testInitialState : AdminState
+testInitialState = mkInitialAdminState
+  [ Minter 1 100.0 100.0
+  , Minter 2 50.0 50.0
+  ]
+
+-- | Runner config for admin-layer properties.
+adConfig : Text -> RunnerConfig
+adConfig name = (defaultRunnerConfig name) with
+  numTests = 100
+  maxSequenceLength = 12
+
+-- | Property A: the fixed model satisfies every admin-layer invariant.
+-- For all action sequences, supply is conserved, allowances stay non-negative,
+-- minted supply matches consumed allowance, and nothing is minted while paused
+-- or by an unauthorized party.
+test_adminInvariantsFixed : Script ()
+test_adminInvariantsFixed = script do
+  let result = runProp (adConfig "admin-invariants-fixed") genAdminAction
+                executeAdminFixed checkAdminInvariants testInitialState
+  case result of
+    AllPassed _ n -> debug ("admin-invariants-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
+
+-- | Property B: conservation (D3) detects an allowance-cap bypass.
+-- The no-allowance executor lets a capped minter mint past its allowance.
+-- EXPECTS FoundFailure — a negative test demonstrating the property has teeth.
+test_adminAllowanceBypassDetected : Script ()
+test_adminAllowanceBypassDetected = script do
+  let result = runProp (adConfig "admin-allowance-bypass") genAdminAction
+                executeAdminNoAllowance invConservation testInitialState
+  case result of
+    FoundFailure d -> do
+      debug "Allowance-cap bypass DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: allowance-cap bypass should have been detected"
+
+-- | Property C: the pause invariant detects a dropped pause guard.
+-- The no-pause executor mints while paused. EXPECTS FoundFailure.
+test_adminPauseBypassDetected : Script ()
+test_adminPauseBypassDetected = script do
+  let result = runProp (adConfig "admin-pause-bypass") genAdminAction
+                executeAdminNoPause invNoMintWhilePaused testInitialState
+  case result of
+    FoundFailure d -> do
+      debug "Pause bypass DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: pause bypass should have been detected"
+
+-- | Property D: the authorization invariant detects a dropped role guard.
+-- The no-auth executor lets a party with no capability mint. EXPECTS FoundFailure.
+test_adminAuthBypassDetected : Script ()
+test_adminAuthBypassDetected = script do
+  let result = runProp (adConfig "admin-auth-bypass") genAdminAction
+                executeAdminNoAuth invAuthorized testInitialState
+  case result of
+    FoundFailure d -> do
+      debug "Authorization bypass DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: authorization bypass should have been detected"
+
+-- | Property E: supply/allowance consistency holds under the fixed model.
+-- Minted supply always equals the allowance consumed from the minter set —
+-- there is no path that increases supply without drawing down an allowance.
+test_adminConsistencyFixed : Script ()
+test_adminConsistencyFixed = script do
+  let result = runProp (adConfig "admin-consistency-fixed") genAdminAction
+                executeAdminFixed invConsistency testInitialState
+  case result of
+    AllPassed _ n -> debug ("admin-consistency-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)

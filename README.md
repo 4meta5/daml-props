@@ -222,11 +222,15 @@ PRNG wrapper (typically not used directly).
 
 ## Dogfooding
 
-daml-props has been validated against two production codebases:
+daml-props has been validated against three production codebases:
 
 ### canton-network-token-standard (simple-token)
 
 Pure state-machine model of the CIP-056 transfer engine. 4 parties, 6 action types (self-transfer, direct transfer, two-step initiate/accept/reject/withdraw). 5 property tests, all passing. See `Examples/`.
+
+### canton-token-template admin layer (AccessControl / Pausable / supply)
+
+Pure state-machine model of the OpenZeppelin [canton-token-template](https://github.com/OpenZeppelin/canton-token-template) minting-control path — `Rules_Mint`, `consumeMintAllowance`, and `assertNotPaused`. Models three admin-layer semantics as invariants over random action sequences (mint / pause / unpause): **pause** (no mint may increase supply while paused), **authorization** (only a party holding a minter capability can mint), and **conservation** (cumulative capped minting never exceeds the issued allowance — CIP supply invariant D3). Following the Amulet pattern, each semantic has a fixed executor that satisfies every invariant and a buggy executor that drops exactly one guard; the negative tests `test_adminAllowanceBypassDetected`, `test_adminPauseBypassDetected`, and `test_adminAuthBypassDetected` each catch the corresponding bypass with a minimal sequence. 5 property tests, all passing. See `DamlProps/Examples/AdminLayer/`. These rows mirror the admin-layer proofs A1–A8 in the companion [daml-verify](https://github.com/OpenZeppelin/daml-verify) project.
 
 ### Splice (amulet)
 
