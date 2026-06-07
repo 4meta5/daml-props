@@ -1,27 +1,33 @@
 -- | Pure state-machine model of the OpenZeppelin canton-token-template AL-10
 -- account-level freeze / compliance hold (`SimpleToken/Rules.daml`). Models the
--- freeze-specific logic of `Rules_SetAccountFrozen` and the unified
--- `assertCanOriginate` origination gate (`assertAccountsNotFrozen`).
+-- freeze-specific logic of `Rules_SetAccountFrozen`, the unified `assertCanOriginate`
+-- origination gate (`assertAccountsNotFrozen` over `accountsFreezeParties`), and the
+-- cold-path mint accept (`Rules_AcceptMintProposal`).
 --
--- Three freeze semantics are modeled as state-machine invariants:
---   * Origination block — an origination with a frozen sender OR receiver never
---     proceeds (the OFAC/AML hold; INV-40).
---   * Admin never frozen — the registry administrator can never be set frozen
---     (it co-signs every holding, so freezing it would brick the registry; INV-42).
---   * Non-idempotency  — a redundant freeze change (re-freeze a held account /
---     unfreeze an unheld one) is rejected, keeping the frozen set duplicate-free
---     (the OZ Pausable semantics; INV-42).
+-- FIVE freeze semantics are modeled as state-machine invariants:
+--   * Origination block (INV-40)   — an origination with ANY frozen participant
+--     never proceeds. Participants are `accountParties` = owner AND provider, so a
+--     hold on either blocks (the review fix #3: checking only the owner let a
+--     sanctioned provider keep transacting).
+--   * Mint-into-frozen block (INV-40) — accepting a cold-path MintProposal whose
+--     recipient was frozen after the proposal was created is rejected (review fix
+--     #1: the freeze is re-checked at holding-creation, closing the propose→accept
+--     window).
+--   * Admin never frozen (INV-42)  — the registry administrator can never be set
+--     frozen (it co-signs every holding).
+--   * Non-idempotency (INV-42)     — a redundant freeze change is rejected.
 --
--- Following the RoleAdmin / AdminLayer examples, each semantic has a FIXED
--- executor (mirroring the real guards) and a BUGGY executor that drops exactly one
--- guard. The fixed executor satisfies every invariant for all action sequences;
--- each buggy executor is caught by the invariant whose guard it dropped.
+-- Each semantic has a FIXED executor (mirroring the real guards) and a BUGGY
+-- executor that drops exactly one guard. CRUCIALLY, the fixed executor computes the
+-- gate decision EXPLICITLY (`proceeds`) and records a bypass only when it would
+-- PROCEED despite a frozen participant — so the fixed-model invariants are NOT
+-- vacuous: breaking the fixed gate (e.g. dropping the freeze check) makes the fixed
+-- executor record a bypass and fail the invariant. Each buggy executor is caught by
+-- the invariant whose guard it dropped.
 --
--- The capability gate (a registry-wide `ComplianceAdmin` cap) is NOT modeled here
--- — it is the generic `requireRole` proven by daml-verify A1–A5 and exercised by
--- the AdminLayer authorization properties. This example isolates the freeze logic.
---
--- Parties are Ints 0..4; party 0 is the registry administrator (`adminParty`).
+-- The capability gate (a registry-wide `ComplianceAdmin` cap) is NOT modeled here —
+-- it is the generic `requireRole` proven by daml-verify A1–A5. This example isolates
+-- the freeze logic. Parties are Ints 0..maxParty; party 0 is the admin.
 module DamlProps.Examples.Freeze.Model where
 
 import DamlProps.Gen
@@ -33,109 +39,170 @@ adminParty = 0
 maxParty : Int
 maxParty = 4
 
--- | Freeze ledger state: the admin, the frozen-account set, and the bypass
+-- | A V2-style account: an owner and an optional provider (a provider-managed
+-- account), mirroring `Splice.Api.Token.HoldingV2.Account` as used by the token.
+data Acct = Acct with
+  aOwner : Int
+  aProvider : Optional Int
+    deriving (Show, Eq)
+
+-- | The freeze-relevant parties of an account — owner AND provider (when distinct).
+-- Mirrors `accountParties` (Account.daml): a hold on EITHER blocks a provider-managed
+-- flow. The owner-only buggy executor drops the provider term to model review-bug #3.
+acctParties : Acct -> [Int]
+acctParties a = case a.aProvider of
+  Some p | p /= a.aOwner -> [a.aOwner, p]
+  _ -> [a.aOwner]
+
+-- | Freeze ledger state: the frozen-account set, open mint proposals, and the bypass
 -- counters the invariants assert stay at 0.
 data FreezeState = FreezeState with
   frozen : [Int]
   -- ^ The `SimpleTokenRules.frozenAccounts` set (kept duplicate-free).
+  pendingMints : [Int]
+  -- ^ Recipients with an open `MintProposal` (cold-path mint awaiting accept).
   frozenOriginated : Int
-  -- ^ Originations that PROCEEDED with a frozen sender or receiver. The unified
+  -- ^ Originations that PROCEEDED with a frozen participant (owner OR provider). The
   -- `assertCanOriginate` gate refuses these; a correct model keeps this at 0.
+  frozenMinted : Int
+  -- ^ Cold-path mint accepts that PROCEEDED into a frozen recipient. The accept-time
+  -- re-check (`Rules_AcceptMintProposal`) refuses these; correct keeps this at 0.
   adminFrozen : Int
-  -- ^ Times the registry admin was set frozen. `Rules_SetAccountFrozen` forbids
-  -- this entirely; a correct model keeps this at 0.
+  -- ^ Times the registry admin was set frozen; `Rules_SetAccountFrozen` forbids it.
   redundantApplied : Int
-  -- ^ Redundant freeze changes that mutated state (re-freeze held / unfreeze
-  -- unheld). The non-idempotency guard refuses these; a correct model keeps 0.
+  -- ^ Redundant freeze changes that mutated state; the non-idempotency guard refuses.
     deriving (Show, Eq)
 
--- | Initial state: nothing frozen, all counters 0.
 mkInitialFreezeState : FreezeState
 mkInitialFreezeState = FreezeState with
   frozen = []
+  pendingMints = []
   frozenOriginated = 0
+  frozenMinted = 0
   adminFrozen = 0
   redundantApplied = 0
 
--- | The freeze actions a (ComplianceAdmin) caller may attempt.
+-- | The freeze actions a (ComplianceAdmin / Treasury) caller may attempt.
 data FreezeAction
   = SetFrozen with sfAccount : Int; sfFrozen : Bool
     -- ^ Set `sfAccount`'s hold to `sfFrozen` (`Rules_SetAccountFrozen`).
-  | Originate with oSender : Int; oReceiver : Int
+  | Originate with oSender : Acct; oReceiver : Acct
     -- ^ Originate a transfer `oSender -> oReceiver` (a factory chokepoint).
+  | ProposeMint with pmRecipient : Int
+    -- ^ A cold-path mint to `pmRecipient` creates a pending proposal (`Rules_Mint`).
+  | AcceptMint with amRecipient : Int
+    -- ^ `amRecipient` accepts their pending proposal (`Rules_AcceptMintProposal`).
     deriving (Show, Eq)
 
--- | Is `account` currently frozen?
 isFrozen : Int -> FreezeState -> Bool
 isFrozen account state = account `elem` state.frozen
 
--- | Add / remove an account from the frozen set (set semantics).
-addFrozen : Int -> [Int] -> [Int]
-addFrozen account fs = if account `elem` fs then fs else account :: fs
+anyFrozen : [Int] -> FreezeState -> Bool
+anyFrozen parties state = any (`isFrozen` state) parties
 
-removeFrozen : Int -> [Int] -> [Int]
-removeFrozen account = filter (/= account)
+addUnique : Int -> [Int] -> [Int]
+addUnique x xs = if x `elem` xs then xs else x :: xs
 
--- | FIXED executor: mirrors `Rules_SetAccountFrozen`'s guards (admin never frozen;
--- redundant change rejected) and the `assertCanOriginate` gate (a frozen sender or
--- receiver blocks origination). Never touches a bypass counter, so they stay 0.
+removeAll : Int -> [Int] -> [Int]
+removeAll x = filter (/= x)
+
+-- | FIXED executor: mirrors the real guards. The origination gate is computed
+-- EXPLICITLY as `proceeds`, and a bypass is recorded only if it would PROCEED with a
+-- frozen participant — so the fixed-model invariants have teeth (break the gate and
+-- the fixed executor records a bypass). Never records a bypass under the real logic.
 executeFreezeFixed : FreezeState -> FreezeAction -> Either Text FreezeState
 executeFreezeFixed state (SetFrozen account frozen)
   | frozen && account == adminParty = Right state              -- admin never freezable
   | isFrozen account state == frozen = Right state             -- redundant (no state change)
-  | frozen = Right state with frozen = addFrozen account state.frozen
-  | otherwise = Right state with frozen = removeFrozen account state.frozen
-executeFreezeFixed state (Originate sender receiver)
-  | isFrozen sender state || isFrozen receiver state = Right state  -- gate: blocked
-  | otherwise = Right state                                         -- proceeds (no balances modeled)
+  | frozen = Right state with frozen = addUnique account state.frozen
+  | otherwise = Right state with frozen = removeAll account state.frozen
+executeFreezeFixed state (Originate sender receiver) =
+  let participants = acctParties sender <> acctParties receiver
+      participantFrozen = anyFrozen participants state
+      proceeds = not participantFrozen                          -- THE GATE (all parties)
+  in Right state with
+       frozenOriginated = state.frozenOriginated + (if proceeds && participantFrozen then 1 else 0)
+executeFreezeFixed state (ProposeMint recipient) =
+  Right state with pendingMints = addUnique recipient state.pendingMints
+executeFreezeFixed state (AcceptMint recipient)
+  | recipient `notElem` state.pendingMints = Right state        -- no open proposal
+  | otherwise =
+      let frozenNow = isFrozen recipient state
+          proceeds = not frozenNow                              -- THE ACCEPT-TIME RE-CHECK (#1)
+      in Right state with
+           pendingMints = removeAll recipient state.pendingMints
+           frozenMinted = state.frozenMinted + (if proceeds && frozenNow then 1 else 0)
 
--- | BUGGY executor — drops the freeze check on origination. A frozen sender or
--- receiver can still originate; such an origination is recorded in
--- `frozenOriginated`. Caught by `invNoFrozenOrigination`.
-executeFreezeNoGate : FreezeState -> FreezeAction -> Either Text FreezeState
-executeFreezeNoGate state (Originate sender receiver) =
-  Right state with
-    frozenOriginated =
-      state.frozenOriginated
-        + (if isFrozen sender state || isFrozen receiver state then 1 else 0)
-executeFreezeNoGate state action = executeFreezeFixed state action
+-- | BUGGY executor — checks only the account OWNER on origination, dropping the
+-- provider term (the review-bug #3: `accountPrincipal` resolves owner-only). When a
+-- provider-managed account's PROVIDER is frozen but its owner is not, the gate
+-- wrongly proceeds; the true participant-frozen status (owner AND provider) records
+-- a bypass. Caught by `invNoFrozenOrigination`.
+executeFreezeOwnerOnly : FreezeState -> FreezeAction -> Either Text FreezeState
+executeFreezeOwnerOnly state (Originate sender receiver) =
+  let participants = acctParties sender <> acctParties receiver  -- truth: owner + provider
+      ownerOnly = [sender.aOwner, receiver.aOwner]               -- bug: owner only
+      participantFrozen = anyFrozen participants state
+      proceeds = not (anyFrozen ownerOnly state)                 -- buggy gate
+  in Right state with
+       frozenOriginated = state.frozenOriginated + (if proceeds && participantFrozen then 1 else 0)
+executeFreezeOwnerOnly state action = executeFreezeFixed state action
 
--- | BUGGY executor — drops the admin carve-out. The admin can be set frozen; such
--- a freeze is recorded in `adminFrozen`. Caught by `invAdminNeverFrozen`.
+-- | BUGGY executor — drops the accept-time freeze re-check (review-bug #1: the
+-- cold-path holding is created without re-checking `frozenAccounts`). A recipient
+-- frozen between propose and accept still receives. Caught by `invNoMintToFrozen`.
+executeFreezeNoAcceptRecheck : FreezeState -> FreezeAction -> Either Text FreezeState
+executeFreezeNoAcceptRecheck state (AcceptMint recipient)
+  | recipient `notElem` state.pendingMints = Right state
+  | otherwise =
+      let frozenNow = isFrozen recipient state
+          proceeds = True                                        -- bug: no re-check
+      in Right state with
+           pendingMints = removeAll recipient state.pendingMints
+           frozenMinted = state.frozenMinted + (if proceeds && frozenNow then 1 else 0)
+executeFreezeNoAcceptRecheck state action = executeFreezeFixed state action
+
+-- | BUGGY executor — drops the admin carve-out; the admin can be set frozen.
+-- Caught by `invAdminNeverFrozen`.
 executeFreezeAdminFreezable : FreezeState -> FreezeAction -> Either Text FreezeState
 executeFreezeAdminFreezable state (SetFrozen account frozen)
   | isFrozen account state == frozen = Right state             -- still rejects redundant
   | frozen = Right state with
-      frozen = addFrozen account state.frozen
+      frozen = addUnique account state.frozen
       adminFrozen = state.adminFrozen + (if account == adminParty then 1 else 0)
-  | otherwise = Right state with frozen = removeFrozen account state.frozen
+  | otherwise = Right state with frozen = removeAll account state.frozen
 executeFreezeAdminFreezable state action = executeFreezeFixed state action
 
--- | BUGGY executor — drops the non-idempotency guard. A redundant change mutates
--- state (and, for a re-freeze, would duplicate); recorded in `redundantApplied`.
--- Caught by `invNoRedundantChange`.
+-- | BUGGY executor — drops the non-idempotency guard. Caught by `invNoRedundantChange`.
 executeFreezeRedundant : FreezeState -> FreezeAction -> Either Text FreezeState
 executeFreezeRedundant state (SetFrozen account frozen)
   | frozen && account == adminParty = Right state              -- still protects admin
   | otherwise =
       let wasRedundant = isFrozen account state == frozen
-          newFrozen = if frozen then account :: state.frozen   -- no dedup → may duplicate
-                      else removeFrozen account state.frozen
+          newFrozen = if frozen then addUnique account state.frozen
+                      else removeAll account state.frozen
       in Right state with
            frozen = newFrozen
            redundantApplied = state.redundantApplied + (if wasRedundant then 1 else 0)
 executeFreezeRedundant state action = executeFreezeFixed state action
 
--- | INVARIANT (origination block, INV-40): no origination ever proceeded with a
--- frozen sender or receiver.
+-- Invariants (each asserts its bypass counter stayed at 0)
+-----------------------------------------------------------
+
 invNoFrozenOrigination : FreezeState -> Either Text ()
 invNoFrozenOrigination state =
   if state.frozenOriginated > 0
     then Left ("Frozen origination: " <> show state.frozenOriginated
-              <> " origination(s) proceeded with a frozen party")
+              <> " origination(s) proceeded with a frozen participant (owner or provider)")
     else Right ()
 
--- | INVARIANT (admin never frozen, INV-42): the registry admin was never frozen.
+invNoMintToFrozen : FreezeState -> Either Text ()
+invNoMintToFrozen state =
+  if state.frozenMinted > 0
+    then Left ("Mint into frozen: " <> show state.frozenMinted
+              <> " cold-path mint(s) accepted into a frozen recipient")
+    else Right ()
+
 invAdminNeverFrozen : FreezeState -> Either Text ()
 invAdminNeverFrozen state =
   if state.adminFrozen > 0
@@ -143,35 +210,43 @@ invAdminNeverFrozen state =
               <> show state.adminFrozen <> " time(s)")
     else Right ()
 
--- | INVARIANT (non-idempotency, INV-42): no redundant freeze change was applied.
 invNoRedundantChange : FreezeState -> Either Text ()
 invNoRedundantChange state =
   if state.redundantApplied > 0
     then Left ("Redundant freeze change: " <> show state.redundantApplied
-              <> " no-op change(s) mutated the frozen set")
+              <> " no-op change(s) applied")
     else Right ()
 
--- | Combined invariant for the fixed model: all three hold simultaneously.
+-- | Combined invariant for the fixed model: all four hold simultaneously.
 checkFreezeInvariants : FreezeState -> Either Text ()
-checkFreezeInvariants state =
-  case invNoFrozenOrigination state of
-    Left e -> Left e
-    Right () -> case invAdminNeverFrozen state of
-      Left e -> Left e
-      Right () -> invNoRedundantChange state
+checkFreezeInvariants state = do
+  invNoFrozenOrigination state
+  invNoMintToFrozen state
+  invAdminNeverFrozen state
+  invNoRedundantChange state
 
--- | Generate freeze actions. Party ids 0..maxParty (0 = admin, to stress the
--- carve-out); the mix exercises freezes/unfreezes of arbitrary accounts (incl.
--- the admin and redundant no-ops) and originations between arbitrary parties
--- (incl. frozen ones), so a dropped guard is reliably triggered.
+-- Generators
+-------------
+
+genParty : Gen Int
+genParty = genInt 0 maxParty
+
+-- | An account: an owner, and (sometimes) a distinct provider — so provider-managed
+-- accounts with a frozen provider arise and exercise the owner-vs-provider gap.
+genAcct : Gen Acct
+genAcct =
+  genBind genParty $ \owner ->
+  genBind genBool $ \managed ->
+  genBind genParty $ \provider ->
+  genPure (Acct with aOwner = owner; aProvider = if managed then Some provider else None)
+
 genFreezeAction : Gen FreezeAction
 genFreezeAction = genFrequency
   [ (4, genSetFrozen)
   , (4, genOriginate)
+  , (2, genProposeMint)
+  , (2, genAcceptMint)
   ]
-
-genParty : Gen Int
-genParty = genInt 0 maxParty
 
 genSetFrozen : Gen FreezeAction
 genSetFrozen =
@@ -181,6 +256,16 @@ genSetFrozen =
 
 genOriginate : Gen FreezeAction
 genOriginate =
-  genBind genParty $ \sender ->
-  genBind genParty $ \receiver ->
+  genBind genAcct $ \sender ->
+  genBind genAcct $ \receiver ->
   genPure (Originate sender receiver)
+
+genProposeMint : Gen FreezeAction
+genProposeMint =
+  genBind genParty $ \recipient ->
+  genPure (ProposeMint recipient)
+
+genAcceptMint : Gen FreezeAction
+genAcceptMint =
+  genBind genParty $ \recipient ->
+  genPure (AcceptMint recipient)
