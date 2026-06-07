@@ -1,0 +1,78 @@
+-- | Property-based tests for the AL-10 account-freeze model. Demonstrates that the
+-- OpenZeppelin canton-token-template freeze semantics — origination block, the
+-- admin carve-out, and non-idempotency — hold for all action sequences, and that
+-- dropping any one guard is detected.
+module DamlProps.Examples.Freeze.Properties where
+
+import Daml.Script
+import DamlProps.Runner
+import DamlProps.Examples.Freeze.Model
+
+-- | Runner config for freeze properties.
+fzConfig : Text -> RunnerConfig
+fzConfig name = (defaultRunnerConfig name) with
+  numTests = 100
+  maxSequenceLength = 12
+
+-- | Property A: the fixed model satisfies every freeze invariant — for all action
+-- sequences, no frozen party originates, the admin is never frozen, and no
+-- redundant change mutates the frozen set.
+test_freezeInvariantsFixed : Script ()
+test_freezeInvariantsFixed = script do
+  let result = runProp (fzConfig "freeze-invariants-fixed") genFreezeAction
+                executeFreezeFixed checkFreezeInvariants mkInitialFreezeState
+  case result of
+    AllPassed _ n -> debug ("freeze-invariants-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
+
+-- | Property B: the origination-block invariant detects a dropped freeze gate.
+-- The no-gate executor lets a frozen sender/receiver originate. EXPECTS FoundFailure.
+test_freezeFrozenOriginationDetected : Script ()
+test_freezeFrozenOriginationDetected = script do
+  let result = runProp (fzConfig "freeze-frozen-origination") genFreezeAction
+                executeFreezeNoGate invNoFrozenOrigination mkInitialFreezeState
+  case result of
+    FoundFailure d -> do
+      debug "Frozen-party origination DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: frozen-party origination should have been detected"
+
+-- | Property C: the admin carve-out invariant detects a dropped admin guard. The
+-- admin-freezable executor lets the registry admin be frozen. EXPECTS FoundFailure.
+test_freezeAdminFreezeDetected : Script ()
+test_freezeAdminFreezeDetected = script do
+  let result = runProp (fzConfig "freeze-admin-freeze") genFreezeAction
+                executeFreezeAdminFreezable invAdminNeverFrozen mkInitialFreezeState
+  case result of
+    FoundFailure d -> do
+      debug "Admin freeze DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: admin freeze should have been detected"
+
+-- | Property D: the non-idempotency invariant detects a dropped redundant-change
+-- guard. The redundant executor applies no-op changes. EXPECTS FoundFailure.
+test_freezeRedundantChangeDetected : Script ()
+test_freezeRedundantChangeDetected = script do
+  let result = runProp (fzConfig "freeze-redundant-change") genFreezeAction
+                executeFreezeRedundant invNoRedundantChange mkInitialFreezeState
+  case result of
+    FoundFailure d -> do
+      debug "Redundant freeze change DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: redundant freeze change should have been detected"
+
+-- | Property E: the origination block holds under the fixed model in isolation — no
+-- frozen party ever originates, for any sequence.
+test_freezeOriginationBlockFixed : Script ()
+test_freezeOriginationBlockFixed = script do
+  let result = runProp (fzConfig "freeze-origination-block-fixed") genFreezeAction
+                executeFreezeFixed invNoFrozenOrigination mkInitialFreezeState
+  case result of
+    AllPassed _ n -> debug ("freeze-origination-block-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
