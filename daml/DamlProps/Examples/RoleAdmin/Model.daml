@@ -1,0 +1,240 @@
+-- | Pure state-machine model of the OpenZeppelin canton-token-template AL-8
+-- role-admin hierarchy. Models the delegated grant/revoke path of
+-- `SimpleToken/Admin/Authority.daml` (`Admin_DelegatedIssueRole` /
+-- `Admin_DelegatedRevokeRole` via the `requireRoleAdmin` chokepoint), the
+-- `delegableViaRoleAdmin` carve-out and `roleAdmin` relation
+-- (`SimpleToken/Admin/Roles.daml`), and `RoleCapability_Renounce`.
+--
+-- Three role-admin semantics are modeled as state-machine invariants:
+--   * Role-admin authorization — to grant/revoke role R through the delegated
+--     path, the caller must hold `roleAdmin R` (the admin role of R).
+--   * Root carve-out          — the `Admin`/`DEFAULT_ADMIN_ROLE` is never grantable
+--     through the delegated path (no re-delegation of root; decision C9).
+--   * Renounce self-only      — a party can only renounce a capability that names it.
+--
+-- Following the AdminLayer / Amulet examples, each semantic has a FIXED executor
+-- (mirroring the real chokepoint logic) and a BUGGY executor that drops exactly
+-- one guard. The fixed executor satisfies every invariant for all action
+-- sequences; each buggy executor is caught by the invariant whose guard it
+-- dropped — demonstrating the properties have teeth.
+--
+-- Design: like the real choices, an unauthorized action is a no-op (Right state
+-- unchanged) rather than an error. Bypasses are recorded in dedicated counters
+-- (kept at 0 by the fixed executor, exactly as the AdminLayer example records
+-- `mintedWhilePaused` / `unauthorizedMinted`).
+--
+-- Roles are modeled as Ints with a flat `roleAdminOf` relation (every role's
+-- admin is `adminRole`), matching the token's flat default `roleAdmin _ = Admin`.
+-- `adminRole` (0) is the root `Admin`/`DEFAULT_ADMIN_ROLE`.
+module DamlProps.Examples.RoleAdmin.Model where
+
+import DamlProps.Gen
+
+-- | The root `Admin` / `DEFAULT_ADMIN_ROLE` (role id 0). Roles 1..maxRole are
+-- operational roles (Minter/Burner/Pauser/... analogues).
+adminRole : Int
+adminRole = 0
+
+maxRole : Int
+maxRole = 3
+
+-- | The role-admin relation (`roleAdmin : Role -> Role`): flat default — every
+-- role is administered by `adminRole`, mirroring the token's `roleAdmin _ = Admin`.
+roleAdminOf : Int -> Int
+roleAdminOf _ = adminRole
+
+-- | A held capability: a party id and the role it was granted. Mirrors a
+-- `RoleCapability` (registry-wide) naming `assignee = grParty`, `role = grRole`.
+data Grant = Grant with
+  grParty : Int
+  grRole : Int
+    deriving (Show, Eq)
+
+-- | Role-admin ledger state: the genesis root, the live grants, and the bypass
+-- counters the invariants assert stay at 0.
+data RoleState = RoleState with
+  rootParty : Int
+  grants : [Grant]
+  escalatedGrants : Int
+  -- ^ Delegated grants made by a caller NOT holding the target role's admin role.
+  -- The real chokepoint refuses these; a correct model keeps this at 0.
+  adminDelegated : Int
+  -- ^ Times the root `Admin` role was granted through the delegated path. The
+  -- carve-out forbids this entirely; a correct model keeps this at 0.
+  crossRenounced : Int
+  -- ^ Renounces that removed a capability the caller does not hold (someone
+  -- else's). Renounce is self-only; a correct model keeps this at 0.
+    deriving (Show, Eq)
+
+-- | Initial state: party 0 is the genesis root; party 1 already holds the `Admin`
+-- role (a governance delegate, as if root-granted at genesis), so the delegated
+-- path can be exercised. Parties 2..4 hold nothing initially.
+mkInitialRoleState : RoleState
+mkInitialRoleState = RoleState with
+  rootParty = 0
+  grants = [ Grant with grParty = 1; grRole = adminRole ]
+  escalatedGrants = 0
+  adminDelegated = 0
+  crossRenounced = 0
+
+-- | The role-admin actions a caller may attempt.
+data RoleAction
+  = RootGrant with rgParty : Int; rgRole : Int
+    -- ^ The genesis root grants any role directly (`Admin_IssueRole`).
+  | DelegatedGrant with dgCaller : Int; dgAssignee : Int; dgRole : Int
+    -- ^ A delegate grants `dgRole` to `dgAssignee` (`Admin_DelegatedIssueRole`).
+  | DelegatedRevoke with drCaller : Int; drParty : Int; drRole : Int
+    -- ^ A delegate revokes a (`drParty`, `drRole`) grant (`Admin_DelegatedRevokeRole`).
+  | Renounce with rnCaller : Int; rnParty : Int; rnRole : Int
+    -- ^ `rnCaller` renounces (`rnParty`, `rnRole`) (`RoleCapability_Renounce`).
+    deriving (Show, Eq)
+
+-- | Does `party` currently hold `role`?
+holdsRole : Int -> Int -> RoleState -> Bool
+holdsRole party role state =
+  any (\g -> g.grParty == party && g.grRole == role) state.grants
+
+-- | Add a grant (set semantics: no duplicates).
+addGrant : Int -> Int -> [Grant] -> [Grant]
+addGrant party role gs =
+  if any (\g -> g.grParty == party && g.grRole == role) gs
+    then gs
+    else (Grant with grParty = party; grRole = role) :: gs
+
+-- | Remove the (party, role) grant if present.
+removeGrant : Int -> Int -> [Grant] -> [Grant]
+removeGrant party role = filter (\g -> not (g.grParty == party && g.grRole == role))
+
+-- | FIXED executor: mirrors the real `requireRoleAdmin` chokepoint + the
+-- `delegableViaRoleAdmin` carve-out + self-only renounce. Enforces all three
+-- guards; never touches a bypass counter, so they stay 0.
+executeRoleFixed : RoleState -> RoleAction -> Either Text RoleState
+executeRoleFixed state (RootGrant party role) =
+  Right state with grants = addGrant party role state.grants     -- root may grant anything
+executeRoleFixed state (DelegatedGrant caller assignee role)
+  | role == adminRole = Right state                              -- carve-out: Admin not delegable (C9)
+  | not (holdsRole caller (roleAdminOf role) state) = Right state -- requireRoleAdmin: caller must hold roleAdmin(role)
+  | otherwise = Right state with grants = addGrant assignee role state.grants
+executeRoleFixed state (DelegatedRevoke caller party role)
+  | role == adminRole = Right state                              -- carve-out: Admin not revocable here
+  | not (holdsRole caller (roleAdminOf role) state) = Right state
+  | otherwise = Right state with grants = removeGrant party role state.grants
+executeRoleFixed state (Renounce caller party role)
+  | caller /= party = Right state                                -- self-only: controller is the assignee
+  | otherwise = Right state with grants = removeGrant party role state.grants
+
+-- | BUGGY executor — drops the role-admin authorization check on DelegatedGrant.
+-- Any caller can grant any non-Admin role; a grant by a caller that does not hold
+-- the role's admin is recorded in `escalatedGrants`. Caught by `invNoEscalation`.
+executeRoleNoRoleAdmin : RoleState -> RoleAction -> Either Text RoleState
+executeRoleNoRoleAdmin state (DelegatedGrant caller assignee role)
+  | role == adminRole = Right state
+  | otherwise = Right state with
+      grants = addGrant assignee role state.grants
+      escalatedGrants =
+        state.escalatedGrants + (if holdsRole caller (roleAdminOf role) state then 0 else 1)
+executeRoleNoRoleAdmin state action = executeRoleFixed state action
+
+-- | BUGGY executor — drops the `Admin` carve-out. A caller holding `Admin` can
+-- re-delegate `Admin` itself; such a grant is recorded in `adminDelegated`.
+-- Caught by `invAdminNotDelegated`.
+executeRoleAdminDelegable : RoleState -> RoleAction -> Either Text RoleState
+executeRoleAdminDelegable state (DelegatedGrant caller assignee role)
+  | not (holdsRole caller (roleAdminOf role) state) = Right state  -- still checks role-admin
+  | otherwise = Right state with
+      grants = addGrant assignee role state.grants
+      adminDelegated = state.adminDelegated + (if role == adminRole then 1 else 0)
+executeRoleAdminDelegable state action = executeRoleFixed state action
+
+-- | BUGGY executor — drops the self-only guard on Renounce. A caller can renounce
+-- another party's capability; such a removal is recorded in `crossRenounced`.
+-- Caught by `invRenounceSelfOnly`.
+executeRoleRenounceCross : RoleState -> RoleAction -> Either Text RoleState
+executeRoleRenounceCross state (Renounce caller party role) =
+  let removedAnothers = caller /= party && holdsRole party role state
+  in Right state with
+    grants = removeGrant party role state.grants
+    crossRenounced = state.crossRenounced + (if removedAnothers then 1 else 0)
+executeRoleRenounceCross state action = executeRoleFixed state action
+
+-- | INVARIANT (role-admin authorization): no role was ever granted through the
+-- delegated path by a caller that did not hold the role's admin role.
+invNoEscalation : RoleState -> Either Text ()
+invNoEscalation state =
+  if state.escalatedGrants > 0
+    then Left ("Privilege escalation: " <> show state.escalatedGrants
+              <> " delegated grant(s) by a non-admin-of-role")
+    else Right ()
+
+-- | INVARIANT (root carve-out): the `Admin`/`DEFAULT_ADMIN_ROLE` was never granted
+-- through the delegated path (no re-delegation of root; C9).
+invAdminNotDelegated : RoleState -> Either Text ()
+invAdminNotDelegated state =
+  if state.adminDelegated > 0
+    then Left ("Root re-delegation: Admin granted via the delegated path "
+              <> show state.adminDelegated <> " time(s)")
+    else Right ()
+
+-- | INVARIANT (renounce self-only): no party ever renounced a capability it does
+-- not hold (someone else's).
+invRenounceSelfOnly : RoleState -> Either Text ()
+invRenounceSelfOnly state =
+  if state.crossRenounced > 0
+    then Left ("Cross-renounce: " <> show state.crossRenounced
+              <> " renounce(s) removed another party's capability")
+    else Right ()
+
+-- | Combined invariant for the fixed model: all three hold simultaneously.
+checkRoleInvariants : RoleState -> Either Text ()
+checkRoleInvariants state =
+  case invNoEscalation state of
+    Left e -> Left e
+    Right () -> case invAdminNotDelegated state of
+      Left e -> Left e
+      Right () -> invRenounceSelfOnly state
+
+-- | Generate role-admin actions. Party ids 0..4 (0 = root, 1 = seeded Admin
+-- delegate, others mostly capability-less to stress authorization); role ids
+-- 0..maxRole (0 = Admin, to stress the carve-out). The mix exercises delegated
+-- grant/revoke by both authorized and unauthorized callers, renounces by self and
+-- others, and occasional root grants that seed fresh holders.
+genRoleAction : Gen RoleAction
+genRoleAction = genFrequency
+  [ (5, genDelegatedGrant)
+  , (3, genRenounce)
+  , (2, genDelegatedRevoke)
+  , (1, genRootGrant)
+  ]
+
+genParty : Gen Int
+genParty = genInt 0 4
+
+genRole : Gen Int
+genRole = genInt 0 maxRole
+
+genRootGrant : Gen RoleAction
+genRootGrant =
+  genBind genParty $ \p ->
+  genBind genRole $ \r ->
+  genPure (RootGrant p r)
+
+genDelegatedGrant : Gen RoleAction
+genDelegatedGrant =
+  genBind genParty $ \caller ->
+  genBind genParty $ \assignee ->
+  genBind genRole $ \r ->
+  genPure (DelegatedGrant caller assignee r)
+
+genDelegatedRevoke : Gen RoleAction
+genDelegatedRevoke =
+  genBind genParty $ \caller ->
+  genBind genParty $ \p ->
+  genBind genRole $ \r ->
+  genPure (DelegatedRevoke caller p r)
+
+genRenounce : Gen RoleAction
+genRenounce =
+  genBind genParty $ \caller ->
+  genBind genParty $ \p ->
+  genBind genRole $ \r ->
+  genPure (Renounce caller p r)

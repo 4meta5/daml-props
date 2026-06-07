@@ -1,0 +1,82 @@
+-- | Property-based tests for the AL-8 role-admin-hierarchy model.
+-- Demonstrates that the OpenZeppelin canton-token-template delegated role-admin
+-- path's three semantics — role-admin authorization, the root (`Admin`) carve-out,
+-- and self-only renounce — hold for all action sequences, and that dropping any
+-- one guard is detected.
+module DamlProps.Examples.RoleAdmin.Properties where
+
+import Daml.Script
+import DamlProps.Runner
+import DamlProps.Examples.RoleAdmin.Model
+
+-- | Runner config for role-admin properties.
+raConfig : Text -> RunnerConfig
+raConfig name = (defaultRunnerConfig name) with
+  numTests = 100
+  maxSequenceLength = 12
+
+-- | Property A: the fixed model satisfies every role-admin invariant.
+-- For all action sequences, no role is granted by a non-admin-of-role, the root
+-- Admin role is never delegated, and no party renounces another's capability.
+test_roleAdminInvariantsFixed : Script ()
+test_roleAdminInvariantsFixed = script do
+  let result = runProp (raConfig "role-admin-invariants-fixed") genRoleAction
+                executeRoleFixed checkRoleInvariants mkInitialRoleState
+  case result of
+    AllPassed _ n -> debug ("role-admin-invariants-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
+
+-- | Property B: the no-escalation invariant detects a dropped role-admin check.
+-- The no-role-admin executor lets any caller grant a role it does not administer.
+-- EXPECTS FoundFailure — a negative test demonstrating the property has teeth.
+test_roleAdminEscalationDetected : Script ()
+test_roleAdminEscalationDetected = script do
+  let result = runProp (raConfig "role-admin-escalation") genRoleAction
+                executeRoleNoRoleAdmin invNoEscalation mkInitialRoleState
+  case result of
+    FoundFailure d -> do
+      debug "Privilege escalation DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: role-admin escalation should have been detected"
+
+-- | Property C: the carve-out invariant detects a dropped `Admin`-is-root-managed
+-- guard. The admin-delegable executor lets an `Admin` holder re-delegate `Admin`.
+-- EXPECTS FoundFailure.
+test_roleAdminRootDelegationDetected : Script ()
+test_roleAdminRootDelegationDetected = script do
+  let result = runProp (raConfig "role-admin-root-delegation") genRoleAction
+                executeRoleAdminDelegable invAdminNotDelegated mkInitialRoleState
+  case result of
+    FoundFailure d -> do
+      debug "Root re-delegation DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: root re-delegation should have been detected"
+
+-- | Property D: the self-only invariant detects a dropped renounce guard.
+-- The renounce-cross executor lets a caller renounce another party's capability.
+-- EXPECTS FoundFailure.
+test_roleAdminCrossRenounceDetected : Script ()
+test_roleAdminCrossRenounceDetected = script do
+  let result = runProp (raConfig "role-admin-cross-renounce") genRoleAction
+                executeRoleRenounceCross invRenounceSelfOnly mkInitialRoleState
+  case result of
+    FoundFailure d -> do
+      debug "Cross-renounce DETECTED by daml-props:"
+      debug ("  Minimal sequence: " <> show (length d.fdMinimalSequence) <> " steps")
+      debug ("  Invariant: " <> d.fdFailure.invariantError)
+    AllPassed _ _ ->
+      error "UNEXPECTED: cross-renounce should have been detected"
+
+-- | Property E: the carve-out holds under the fixed model in isolation — the root
+-- Admin role is never reachable through the delegated path for any sequence.
+test_roleAdminCarveOutFixed : Script ()
+test_roleAdminCarveOutFixed = script do
+  let result = runProp (raConfig "role-admin-carveout-fixed") genRoleAction
+                executeRoleFixed invAdminNotDelegated mkInitialRoleState
+  case result of
+    AllPassed _ n -> debug ("role-admin-carveout-fixed: PASSED (" <> show n <> " tests)")
+    FoundFailure d -> error (formatDetail d)
